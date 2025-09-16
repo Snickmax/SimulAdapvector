@@ -17,13 +17,25 @@ except ImportError:
     print("⚠️ Plotly no está instalado. Las visualizaciones no estarán disponibles.")
 
 class ImprovedMiningScheduler:
-    def __init__(self, project_start_date=None, current_date=None, simulation_id=None):
+    def __init__(self,
+                 project_start_date=None,
+                 current_date=None,
+                 simulation_id=None,
+                 start_date_min=None,
+                 start_date_max=None):
         """
         Inicializa el simulador mejorado con múltiples simulaciones coherentes
         """
         self.simulation_id = simulation_id or f"SIM-{random.randint(1000, 9999)}"
-        # Proyecto comienza entre 180 y 365 días antes de la fecha actual para proyectos más realistas
-        self.project_start_date = project_start_date or datetime.now() - timedelta(days=random.randint(180, 365))
+        # Mantener referencia del rango definido por el usuario (si existe)
+        self.project_start_min = start_date_min
+        self.project_start_max = start_date_max
+
+        if project_start_date is not None:
+            self.project_start_date = project_start_date
+        else:
+            self.project_start_date = self._determine_project_start_date(start_date_min, start_date_max)
+
         self.current_date = current_date or datetime.now()
         self.tasks = []
         self.phases = [
@@ -66,6 +78,24 @@ class ImprovedMiningScheduler:
 
         # Tipos de relaciones de precedencia
         self.dependency_types = ["FS", "SS", "FF", "SF"]
+
+    def _determine_project_start_date(self, start_date_min, start_date_max):
+        """Determina la fecha de inicio del proyecto considerando rangos personalizados."""
+        if start_date_min and start_date_max:
+            if start_date_min > start_date_max:
+                start_date_min, start_date_max = start_date_max, start_date_min
+            delta_days = (start_date_max - start_date_min).days
+            random_offset = random.randint(0, delta_days) if delta_days > 0 else 0
+            return start_date_min + timedelta(days=random_offset)
+
+        if start_date_min and not start_date_max:
+            return start_date_min
+
+        if start_date_max and not start_date_min:
+            return start_date_max
+
+        # Proyecto comienza entre 180 y 365 días antes de la fecha actual para proyectos más realistas
+        return datetime.now() - timedelta(days=random.randint(180, 365))
 
     def _generate_simulation_config(self):
         """
@@ -1348,7 +1378,10 @@ class ImprovedMiningScheduler:
 
 # FUNCIONES AUXILIARES GLOBALES
 
-def generate_multiple_simulations(num_simulations=3):
+def generate_multiple_simulations(num_simulations=3,
+                                  project_start_min=None,
+                                  project_start_max=None,
+                                  current_date=None):
     """
     Genera múltiples simulaciones con configuraciones diferentes
     """
@@ -1362,7 +1395,11 @@ def generate_multiple_simulations(num_simulations=3):
         print("-"*40)
 
         # Crear simulación con configuración única
-        scheduler = ImprovedMiningScheduler()
+        scheduler = ImprovedMiningScheduler(
+            start_date_min=project_start_min,
+            start_date_max=project_start_max,
+            current_date=current_date
+        )
         scheduler.generate_coherent_tasks()
 
         # Obtener métricas
@@ -1454,13 +1491,54 @@ def create_comparison_dashboard(simulations):
 
 
 # FUNCIÓN PRINCIPAL DE EJECUCIÓN
+def request_date_input(message, allow_empty=False, default_value=None):
+    """Solicita al usuario una fecha válida en formato AAAA-MM-DD."""
+    while True:
+        user_input = input(message).strip()
+
+        if not user_input:
+            if allow_empty:
+                return default_value
+            print("❌ Este campo es obligatorio. Intenta nuevamente.")
+            continue
+
+        try:
+            return datetime.strptime(user_input, "%Y-%m-%d")
+        except ValueError:
+            print("❌ Formato inválido. Utiliza el formato AAAA-MM-DD.")
+
+
 def run_simulation():
     """Ejecuta la simulación completa"""
     print("🚀 SIMULADOR AVANZADO DE CRONOGRAMAS CON DEPENDENCIAS REALISTAS")
     print("="*70)
 
+    print("\n📅 CONFIGURACIÓN DE FECHAS")
+    print("-"*50)
+    min_date = request_date_input("Fecha mínima de inicio del proyecto (AAAA-MM-DD): ")
+    max_date = request_date_input("Fecha máxima de inicio del proyecto (AAAA-MM-DD): ")
+
+    if max_date < min_date:
+        print("⚠️ La fecha máxima es menor que la mínima. Se intercambiarán los valores.")
+        min_date, max_date = max_date, min_date
+
+    today_default = datetime.now()
+    current_reference = request_date_input(
+        "Fecha actual para evaluar el proyecto (AAAA-MM-DD) [Enter para usar la fecha de hoy]: ",
+        allow_empty=True,
+        default_value=today_default
+    ) or today_default
+
+    print(f"\n🗓️ Rango seleccionado: {min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')}")
+    print(f"📍 Fecha de evaluación: {current_reference.strftime('%d/%m/%Y')}")
+
     # Generar simulaciones
-    simulations = generate_multiple_simulations(num_simulations=3)
+    simulations = generate_multiple_simulations(
+        num_simulations=3,
+        project_start_min=min_date,
+        project_start_max=max_date,
+        current_date=current_reference
+    )
 
     # Mostrar resumen
     print("\n📊 RESUMEN FINAL")
