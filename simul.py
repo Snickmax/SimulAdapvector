@@ -42,6 +42,8 @@ class ImprovedMiningScheduler:
         self.current_date = current_date or datetime.now()
         self.tasks = []
         self.max_delay_days = max_delay_days
+        self.schedule_compression_factor = 1.0
+        self.schedule_was_compressed = False
         self.phases = [
             "Preparación del Terreno",
             "Movimiento de Tierra",
@@ -368,6 +370,98 @@ class ImprovedMiningScheduler:
 
         return task_start, task_end
 
+    def _adjust_schedule_to_range(self, tasks):
+        """Ajusta las fechas planificadas para respetar el rango solicitado por el usuario."""
+        if not tasks:
+            return
+
+        if not (self.project_start_min and self.project_start_max):
+            return
+
+        # Ordenar el rango en caso de que haya sido ingresado al revés
+        if self.project_start_min > self.project_start_max:
+            self.project_start_min, self.project_start_max = self.project_start_max, self.project_start_min
+
+        valid_starts = [t.get("calculated_start") for t in tasks if isinstance(t.get("calculated_start"), datetime)]
+        valid_ends = [t.get("calculated_end") for t in tasks if isinstance(t.get("calculated_end"), datetime)]
+
+        if not valid_starts or not valid_ends:
+            return
+
+        current_start = min(valid_starts)
+        current_end = max(valid_ends)
+
+        start_min = self.project_start_min
+        start_max = self.project_start_max
+
+        available_window_days = (start_max - start_min).days
+        project_span_days = (current_end - current_start).days
+
+        if available_window_days <= 0:
+            # No hay ventana disponible: fijar todo en la fecha mínima
+            for task in tasks:
+                task["calculated_start"] = start_min
+                task["calculated_end"] = start_min
+            self.project_start_date = start_min
+            self.schedule_compression_factor = 0.0
+            self.schedule_was_compressed = True
+        elif project_span_days <= available_window_days:
+            # Hay espacio suficiente: desplazar cronograma dentro del rango
+            max_start_for_fit = start_max - timedelta(days=project_span_days)
+            if max_start_for_fit < start_min:
+                max_start_for_fit = start_min
+
+            shift_range = (max_start_for_fit - start_min).days
+            random_offset = random.randint(0, shift_range) if shift_range > 0 else 0
+            new_start = start_min + timedelta(days=random_offset)
+            delta = new_start - current_start
+
+            if delta != timedelta(0):
+                for task in tasks:
+                    task["calculated_start"] += delta
+                    task["calculated_end"] += delta
+
+            self.project_start_date = new_start
+            self.schedule_compression_factor = 1.0
+            self.schedule_was_compressed = False
+        else:
+            # El proyecto excede la ventana: comprimir fechas proporcionalmente
+            compression_factor = available_window_days / project_span_days if project_span_days > 0 else 1.0
+            compression_factor = max(0.0, min(1.0, compression_factor))
+            new_start = start_min
+
+            for task in tasks:
+                offset_days = (task["calculated_start"] - current_start).days
+                compressed_offset = int(round(offset_days * compression_factor))
+                compressed_start = new_start + timedelta(days=compressed_offset)
+
+                original_duration = (task["calculated_end"] - task["calculated_start"]).days + 1
+                compressed_duration = max(1, int(round(original_duration * compression_factor)))
+                compressed_end = compressed_start + timedelta(days=compressed_duration - 1)
+
+                if compressed_start > start_max:
+                    compressed_start = start_max
+                    compressed_end = start_max
+                    compressed_duration = 1
+                elif compressed_end > start_max:
+                    compressed_end = start_max
+                    compressed_duration = max(1, (compressed_end - compressed_start).days + 1)
+
+                task["calculated_start"] = compressed_start
+                task["calculated_end"] = compressed_end
+                task["duracion"] = compressed_duration
+
+            self.project_start_date = new_start
+            self.schedule_compression_factor = compression_factor
+            self.schedule_was_compressed = True
+
+        # Actualizar duraciones planificadas tras el ajuste
+        for task in tasks:
+            start = task.get("calculated_start")
+            end = task.get("calculated_end")
+            if isinstance(start, datetime) and isinstance(end, datetime):
+                task["duracion"] = max(1, (end - start).days + 1)
+
     def calculate_delay_days(self, task):
         """
         Calcula los días de retraso acumulados para una tarea
@@ -536,6 +630,9 @@ class ImprovedMiningScheduler:
                 start, end = self._calculate_task_dates(task, enhanced_tasks)
                 task["calculated_start"] = start
                 task["calculated_end"] = end
+
+        # Ajustar el cronograma al rango solicitado por el usuario (si aplica)
+        self._adjust_schedule_to_range(enhanced_tasks)
 
         # Calcular cuántas tareas de cada tipo necesitamos
         total_tasks = len(enhanced_tasks)
