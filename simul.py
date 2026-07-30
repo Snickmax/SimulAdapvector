@@ -16,16 +16,34 @@ except ImportError:
     PLOTLY_AVAILABLE = False
     print("⚠️ Plotly no está instalado. Las visualizaciones no estarán disponibles.")
 
+DEFAULT_MAX_DELAY = 120
+
 class ImprovedMiningScheduler:
-    def __init__(self, project_start_date=None, current_date=None, simulation_id=None):
+    def __init__(self,
+                 project_start_date=None,
+                 current_date=None,
+                 simulation_id=None,
+                 start_date_min=None,
+                 start_date_max=None,
+                 max_delay_days=DEFAULT_MAX_DELAY):
         """
         Inicializa el simulador mejorado con múltiples simulaciones coherentes
         """
         self.simulation_id = simulation_id or f"SIM-{random.randint(1000, 9999)}"
-        # Proyecto comienza entre 180 y 365 días antes de la fecha actual para proyectos más realistas
-        self.project_start_date = project_start_date or datetime.now() - timedelta(days=random.randint(180, 365))
+        # Mantener referencia del rango definido por el usuario (si existe)
+        self.project_start_min = start_date_min
+        self.project_start_max = start_date_max
+
+        if project_start_date is not None:
+            self.project_start_date = project_start_date
+        else:
+            self.project_start_date = self._determine_project_start_date(start_date_min, start_date_max)
+
         self.current_date = current_date or datetime.now()
         self.tasks = []
+        self.max_delay_days = max_delay_days
+        self.schedule_compression_factor = 1.0
+        self.schedule_was_compressed = False
         self.phases = [
             "Preparación del Terreno",
             "Movimiento de Tierra",
@@ -66,6 +84,24 @@ class ImprovedMiningScheduler:
 
         # Tipos de relaciones de precedencia
         self.dependency_types = ["FS", "SS", "FF", "SF"]
+
+    def _determine_project_start_date(self, start_date_min, start_date_max):
+        """Determina la fecha de inicio del proyecto considerando rangos personalizados."""
+        if start_date_min and start_date_max:
+            if start_date_min > start_date_max:
+                start_date_min, start_date_max = start_date_max, start_date_min
+            delta_days = (start_date_max - start_date_min).days
+            random_offset = random.randint(0, delta_days) if delta_days > 0 else 0
+            return start_date_min + timedelta(days=random_offset)
+
+        if start_date_min and not start_date_max:
+            return start_date_min
+
+        if start_date_max and not start_date_min:
+            return start_date_max
+
+        # Proyecto comienza entre 180 y 365 días antes de la fecha actual para proyectos más realistas
+        return datetime.now() - timedelta(days=random.randint(180, 365))
 
     def _generate_simulation_config(self):
         """
@@ -334,34 +370,142 @@ class ImprovedMiningScheduler:
 
         return task_start, task_end
 
+    def _adjust_schedule_to_range(self, tasks):
+        """Ajusta las fechas planificadas para respetar el rango solicitado por el usuario."""
+        if not tasks:
+            return
+
+        if not (self.project_start_min and self.project_start_max):
+            return
+
+        # Ordenar el rango en caso de que haya sido ingresado al revés
+        if self.project_start_min > self.project_start_max:
+            self.project_start_min, self.project_start_max = self.project_start_max, self.project_start_min
+
+        valid_starts = [t.get("calculated_start") for t in tasks if isinstance(t.get("calculated_start"), datetime)]
+        valid_ends = [t.get("calculated_end") for t in tasks if isinstance(t.get("calculated_end"), datetime)]
+
+        if not valid_starts or not valid_ends:
+            return
+
+        current_start = min(valid_starts)
+        current_end = max(valid_ends)
+
+        start_min = self.project_start_min
+        start_max = self.project_start_max
+
+        available_window_days = (start_max - start_min).days
+        project_span_days = (current_end - current_start).days
+
+        if available_window_days <= 0:
+            # No hay ventana disponible: fijar todo en la fecha mínima
+            for task in tasks:
+                task["calculated_start"] = start_min
+                task["calculated_end"] = start_min
+            self.project_start_date = start_min
+            self.schedule_compression_factor = 0.0
+            self.schedule_was_compressed = True
+        elif project_span_days <= available_window_days:
+            # Hay espacio suficiente: desplazar cronograma dentro del rango
+            max_start_for_fit = start_max - timedelta(days=project_span_days)
+            if max_start_for_fit < start_min:
+                max_start_for_fit = start_min
+
+            shift_range = (max_start_for_fit - start_min).days
+            random_offset = random.randint(0, shift_range) if shift_range > 0 else 0
+            new_start = start_min + timedelta(days=random_offset)
+            delta = new_start - current_start
+
+            if delta != timedelta(0):
+                for task in tasks:
+                    task["calculated_start"] += delta
+                    task["calculated_end"] += delta
+
+            self.project_start_date = new_start
+            self.schedule_compression_factor = 1.0
+            self.schedule_was_compressed = False
+        else:
+            # El proyecto excede la ventana: comprimir fechas proporcionalmente
+            compression_factor = available_window_days / project_span_days if project_span_days > 0 else 1.0
+            compression_factor = max(0.0, min(1.0, compression_factor))
+            new_start = start_min
+
+            for task in tasks:
+                offset_days = (task["calculated_start"] - current_start).days
+                compressed_offset = int(round(offset_days * compression_factor))
+                compressed_start = new_start + timedelta(days=compressed_offset)
+
+                original_duration = (task["calculated_end"] - task["calculated_start"]).days + 1
+                compressed_duration = max(1, int(round(original_duration * compression_factor)))
+                compressed_end = compressed_start + timedelta(days=compressed_duration - 1)
+
+                if compressed_start > start_max:
+                    compressed_start = start_max
+                    compressed_end = start_max
+                    compressed_duration = 1
+                elif compressed_end > start_max:
+                    compressed_end = start_max
+                    compressed_duration = max(1, (compressed_end - compressed_start).days + 1)
+
+                task["calculated_start"] = compressed_start
+                task["calculated_end"] = compressed_end
+                task["duracion"] = compressed_duration
+
+            self.project_start_date = new_start
+            self.schedule_compression_factor = compression_factor
+            self.schedule_was_compressed = True
+
+        # Actualizar duraciones planificadas tras el ajuste
+        for task in tasks:
+            start = task.get("calculated_start")
+            end = task.get("calculated_end")
+            if isinstance(start, datetime) and isinstance(end, datetime):
+                task["duracion"] = max(1, (end - start).days + 1)
+
     def calculate_delay_days(self, task):
         """
         Calcula los días de retraso acumulados para una tarea
         """
-        if task["Estado"] == "No iniciada":
-            if isinstance(task["Inicio Planificado"], datetime) and task["Inicio Planificado"] < self.current_date:
-                return (self.current_date - task["Inicio Planificado"]).days
-            else:
-                return 0
+        state = str(task.get("Estado", ""))
 
-        elif "En progreso" in task["Estado"]:
-            if isinstance(task["Fin Planificado"], datetime) and task["Fin Planificado"] < self.current_date:
-                return (self.current_date - task["Fin Planificado"]).days
-            else:
-                if isinstance(task["Inicio Planificado"], datetime):
-                    days_since_start = (self.current_date - task["Inicio Planificado"]).days
-                    expected_progress = min(100, (days_since_start / task["Duración Planificada (días)"]) * 100)
-                    actual_progress = task["% Avance Físico"]
+        def clamp(delay_value):
+            if not isinstance(delay_value, (int, float)):
+                return 0
+            if delay_value <= 0:
+                return int(delay_value)
+            if self.max_delay_days is None:
+                return int(delay_value)
+            return int(min(delay_value, self.max_delay_days))
+
+        planned_start = task.get("Inicio Planificado")
+        planned_end = task.get("Fin Planificado")
+
+        if state.startswith("No iniciada"):
+            if isinstance(planned_start, datetime) and planned_start < self.current_date:
+                delay_value = (self.current_date - planned_start).days
+                return clamp(delay_value)
+            return 0
+
+        if "En progreso" in state:
+            if isinstance(planned_end, datetime) and planned_end < self.current_date:
+                delay_value = (self.current_date - planned_end).days
+                return clamp(delay_value)
+
+            if isinstance(planned_start, datetime):
+                days_since_start = (self.current_date - planned_start).days
+                if task["Duración Planificada (días)"] > 0:
+                    expected_progress = max(0, min(100, (days_since_start / task["Duración Planificada (días)"]) * 100))
+                    actual_progress = task.get("% Avance Físico", 0)
                     if expected_progress > actual_progress:
                         progress_delay = ((expected_progress - actual_progress) / 100) * task["Duración Planificada (días)"]
-                        return int(progress_delay)
-                return 0
+                        return clamp(progress_delay)
+            return 0
 
-        elif "Completada" in task["Estado"]:
-            if task.get("Retraso (días)", 0) > 0:
-                return task["Retraso (días)"]
-            else:
-                return 0
+        if "Completada" in state:
+            delay_value = task.get("Retraso (días)", 0)
+            if delay_value > 0:
+                return clamp(delay_value)
+            return 0
 
         return 0
 
@@ -385,11 +529,13 @@ class ImprovedMiningScheduler:
         base_buffer = max(min_buffer, int(base_duration * buffer_multiplier))
         risk_adjustment = int(base_buffer * risk_factor)
 
-        if task["Estado"] == "No iniciada":
+        state_text = str(task.get("Estado", ""))
+
+        if state_text.startswith("No iniciada"):
             state_adjustment = 0
-        elif "En progreso" in task["Estado"] and "retraso" in task["Estado"]:
+        elif "En progreso" in state_text and "retraso" in state_text:
             state_adjustment = int(base_buffer * 0.5)
-        elif "En progreso" in task["Estado"]:
+        elif "En progreso" in state_text:
             state_adjustment = int(base_buffer * 0.2)
         else:
             state_adjustment = 0
@@ -485,6 +631,9 @@ class ImprovedMiningScheduler:
                 task["calculated_start"] = start
                 task["calculated_end"] = end
 
+        # Ajustar el cronograma al rango solicitado por el usuario (si aplica)
+        self._adjust_schedule_to_range(enhanced_tasks)
+
         # Calcular cuántas tareas de cada tipo necesitamos
         total_tasks = len(enhanced_tasks)
         target_completed = int(total_tasks * self.simulation_config['completed_percentage'])
@@ -532,8 +681,11 @@ class ImprovedMiningScheduler:
                 **task_status
             }
 
-            # Calcular las nuevas columnas
-            task["Días de Retraso"] = self.calculate_delay_days(task)
+            # Ajustar estados en función de la fecha actual y calcular métricas
+            self._normalize_future_task_state(task)
+            delay_days = self.calculate_delay_days(task)
+            self._apply_delay_to_state(task, delay_days)
+            task["Días de Retraso"] = delay_days
             task["Buffer sugerido (días)"] = self.calculate_buffer_days(task)
 
             self.tasks.append(task)
@@ -656,6 +808,9 @@ class ImprovedMiningScheduler:
 
             elif variation == 'delayed':
                 delay_days = int(duration * self.simulation_config['delay_factor'] * random.uniform(0.5, 1.5))
+                delay_days = max(1, delay_days)
+                if self.max_delay_days is not None:
+                    delay_days = min(delay_days, self.max_delay_days)
                 real_end = planned_end + timedelta(days=delay_days)
                 real_duration = duration + delay_days
                 cost_overrun = delay_days * (cost / duration) * 0.3
@@ -739,6 +894,77 @@ class ImprovedMiningScheduler:
                 "Causa de Retraso": "N/A",
                 "Observaciones": "Esperando inicio"
             }
+
+    def _normalize_future_task_state(self, task):
+        """Ajusta tareas con estados inconsistentes respecto a la fecha actual."""
+        planned_start = task.get("Inicio Planificado")
+        state = str(task.get("Estado", ""))
+
+        if isinstance(planned_start, datetime) and planned_start > self.current_date:
+            if "Completada" in state or "En progreso" in state:
+                task.update({
+                    "Estado": "No iniciada",
+                    "Inicio Real": "Pendiente",
+                    "Fin Real": "Pendiente",
+                    "Duración Real (días)": "Pendiente",
+                    "% Avance Físico": 0,
+                    "Costo Real (USD)": "Pendiente",
+                    "Retraso (días)": 0,
+                    "Sobrecosto (USD)": "N/A",
+                    "Causa de Retraso": "N/A",
+                    "Observaciones": "Programada para iniciar en el futuro"
+                })
+
+    def _apply_delay_to_state(self, task, delay_days):
+        """Sincroniza el estado textual con los días de retraso calculados."""
+        state = str(task.get("Estado", ""))
+
+        if self.max_delay_days is not None and isinstance(delay_days, (int, float)):
+            delay_days = min(delay_days, self.max_delay_days)
+
+        if state.startswith("No iniciada"):
+            if delay_days and delay_days > 0:
+                task["Estado"] = "No iniciada (retrasada)"
+                task["Retraso (días)"] = delay_days
+                if task.get("Causa de Retraso") in (None, "", "N/A"):
+                    task["Causa de Retraso"] = random.choice(self.delay_causes)
+                task["Observaciones"] = f"La tarea acumula {delay_days} días de retraso"
+            else:
+                task["Estado"] = "No iniciada"
+                task["Retraso (días)"] = 0
+                task["Causa de Retraso"] = "N/A"
+                planned_start = task.get("Inicio Planificado")
+                if isinstance(planned_start, datetime) and planned_start > self.current_date:
+                    task["Observaciones"] = "Programada para iniciar en el futuro"
+                else:
+                    task["Observaciones"] = "Esperando inicio"
+
+        elif "En progreso" in state:
+            if delay_days and delay_days > 0:
+                if "retraso" not in state.lower():
+                    task["Estado"] = "En progreso (con retraso)"
+                task["Retraso (días)"] = delay_days
+                if task.get("Causa de Retraso") in (None, "", "N/A"):
+                    task["Causa de Retraso"] = random.choice(self.delay_causes)
+                task["Observaciones"] = "Avance retrasado respecto al plan"
+            else:
+                if "retraso" in state.lower():
+                    task["Estado"] = "En progreso"
+                task["Retraso (días)"] = 0
+                if task.get("Causa de Retraso") not in (None, "", "N/A"):
+                    task["Causa de Retraso"] = "N/A"
+                if "retraso" in str(task.get("Observaciones", "")).lower():
+                    task["Observaciones"] = "Avance según lo planificado"
+
+        elif "Completada" in state:
+            if isinstance(task.get("Retraso (días)"), (int, float)) and task["Retraso (días)"] > 0:
+                if self.max_delay_days is not None:
+                    task["Retraso (días)"] = min(task["Retraso (días)"], self.max_delay_days)
+                if task.get("Causa de Retraso") in (None, "", "N/A"):
+                    task["Causa de Retraso"] = random.choice(self.delay_causes)
+            elif "retraso" in state.lower():
+                task["Estado"] = "Completada"
+                task["Causa de Retraso"] = "N/A"
 
     def create_dataframe(self):
         """Convierte la lista de tareas a DataFrame"""
@@ -926,7 +1152,7 @@ class ImprovedMiningScheduler:
                 ))
 
             # Barra real
-            if row["Estado"] != "No iniciada" and row["Inicio Real"] != "Pendiente":
+            if not str(row["Estado"]).startswith("No iniciada") and row["Inicio Real"] != "Pendiente":
                 if row["Fin Real"] != "Pendiente" and row["Fin Real"] != "En ejecución":
                     end_date = row["Fin Real"]
                     line_style = dict(color=colors.get(row["Fase"], "#95A5A6"), width=15)
@@ -1027,9 +1253,10 @@ class ImprovedMiningScheduler:
                     print(f"  Tareas: {len(fase_df)}")
                     print(f"  Inicio: {valid_starts.min().strftime('%d/%m/%Y')}")
                     print(f"  Fin: {valid_ends.max().strftime('%d/%m/%Y')}")
+                    not_started_mask = fase_df['Estado'].str.startswith('No iniciada', na=False)
                     print(f"  Estados: Completadas={len(fase_df[fase_df['Estado'].str.contains('Completada', na=False)])}, "
                           f"En progreso={len(fase_df[fase_df['Estado'].str.contains('En progreso', na=False)])}, "
-                          f"No iniciadas={len(fase_df[fase_df['Estado'] == 'No iniciada'])}")
+                          f"No iniciadas={not_started_mask.sum()}")
 
         print("\n" + "="*80)
 
@@ -1096,7 +1323,7 @@ class ImprovedMiningScheduler:
         # Contadores de estado
         completed = len(df[df["Estado"].str.contains("Completada", na=False)])
         in_progress = len(df[df["Estado"].str.contains("En progreso", na=False)])
-        not_started = len(df[df["Estado"] == "No iniciada"])
+        not_started = len(df[df["Estado"].str.startswith("No iniciada", na=False)])
 
         # Análisis de retrasos
         delayed_tasks = df[df["Días de Retraso"] > 0]
@@ -1127,6 +1354,7 @@ class ImprovedMiningScheduler:
             "⚠️ Tareas con retraso": len(delayed_tasks),
             "📅 Total días de retraso": int(total_delay_days),
             "🚨 Máximo retraso": f"{int(max_delay)} días",
+            "🚦 Límite de retraso": f"{self.max_delay_days} días" if self.max_delay_days is not None else "Sin límite",
             "🛡️ Buffer promedio": f"{avg_buffer:.1f} días",
             "🛡️ Buffer total": f"{int(total_buffer)} días",
             "💰 Presupuesto": f"${total_planned_cost:,.0f}",
@@ -1348,7 +1576,11 @@ class ImprovedMiningScheduler:
 
 # FUNCIONES AUXILIARES GLOBALES
 
-def generate_multiple_simulations(num_simulations=3):
+def generate_multiple_simulations(num_simulations=3,
+                                  project_start_min=None,
+                                  project_start_max=None,
+                                  current_date=None,
+                                  max_delay_days=DEFAULT_MAX_DELAY):
     """
     Genera múltiples simulaciones con configuraciones diferentes
     """
@@ -1362,7 +1594,12 @@ def generate_multiple_simulations(num_simulations=3):
         print("-"*40)
 
         # Crear simulación con configuración única
-        scheduler = ImprovedMiningScheduler()
+        scheduler = ImprovedMiningScheduler(
+            start_date_min=project_start_min,
+            start_date_max=project_start_max,
+            current_date=current_date,
+            max_delay_days=max_delay_days
+        )
         scheduler.generate_coherent_tasks()
 
         # Obtener métricas
@@ -1416,7 +1653,7 @@ def create_comparison_dashboard(simulations):
         # Contadores
         completed.append(len(df[df["Estado"].str.contains("Completada", na=False)]))
         in_progress.append(len(df[df["Estado"].str.contains("En progreso", na=False)]))
-        not_started.append(len(df[df["Estado"] == "No iniciada"]))
+        not_started.append(len(df[df["Estado"].str.startswith("No iniciada", na=False)]))
 
         # Retrasos
         total_delays.append(df[df["Días de Retraso"] > 0]["Días de Retraso"].sum())
@@ -1454,13 +1691,73 @@ def create_comparison_dashboard(simulations):
 
 
 # FUNCIÓN PRINCIPAL DE EJECUCIÓN
+def request_date_input(message, allow_empty=False, default_value=None):
+    """Solicita al usuario una fecha válida en formato AAAA-MM-DD."""
+    while True:
+        user_input = input(message).strip()
+
+        if not user_input:
+            if allow_empty:
+                return default_value
+            print("❌ Este campo es obligatorio. Intenta nuevamente.")
+            continue
+
+        try:
+            return datetime.strptime(user_input, "%Y-%m-%d")
+        except ValueError:
+            print("❌ Formato inválido. Utiliza el formato AAAA-MM-DD.")
+
+
 def run_simulation():
     """Ejecuta la simulación completa"""
     print("🚀 SIMULADOR AVANZADO DE CRONOGRAMAS CON DEPENDENCIAS REALISTAS")
     print("="*70)
 
+    print("\n📅 CONFIGURACIÓN DE FECHAS")
+    print("-"*50)
+    min_date = request_date_input("Fecha mínima de inicio del proyecto (AAAA-MM-DD): ")
+    max_date = request_date_input("Fecha máxima de inicio del proyecto (AAAA-MM-DD): ")
+
+    if max_date < min_date:
+        print("⚠️ La fecha máxima es menor que la mínima. Se intercambiarán los valores.")
+        min_date, max_date = max_date, min_date
+
+    today_default = datetime.now()
+    current_reference = request_date_input(
+        "Fecha actual para evaluar el proyecto (AAAA-MM-DD) [Enter para usar la fecha de hoy]: ",
+        allow_empty=True,
+        default_value=today_default
+    ) or today_default
+
+    default_delay_limit = DEFAULT_MAX_DELAY
+    while True:
+        delay_input = input(
+            f"Máximo de días de retraso permitidos [Enter para {default_delay_limit}]: "
+        ).strip()
+        if not delay_input:
+            max_delay_limit = default_delay_limit
+            break
+        try:
+            max_delay_limit = int(delay_input)
+            if max_delay_limit <= 0:
+                print("❌ Ingresa un número mayor que cero.")
+                continue
+            break
+        except ValueError:
+            print("❌ Ingresa un valor numérico válido.")
+
+    print(f"\n🗓️ Rango seleccionado: {min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')}")
+    print(f"📍 Fecha de evaluación: {current_reference.strftime('%d/%m/%Y')}")
+    print(f"🚦 Máximo de días de retraso aplicable: {max_delay_limit}")
+
     # Generar simulaciones
-    simulations = generate_multiple_simulations(num_simulations=3)
+    simulations = generate_multiple_simulations(
+        num_simulations=3,
+        project_start_min=min_date,
+        project_start_max=max_date,
+        current_date=current_reference,
+        max_delay_days=max_delay_limit
+    )
 
     # Mostrar resumen
     print("\n📊 RESUMEN FINAL")
